@@ -39,6 +39,7 @@ IGNORED_FILES = [".DS_Store", ".apdisk", "Thumbs.db"]
 # Synology thumbnail folder
 THUMB_DIR = '@eaDir'
 # Synology thumbnail sizes (fit to size), descending order
+# See http://www.web3.lu/managing-thumbnails-synology-photostation/
 THUMB_SIZES = [
     ('SYNOPHOTO_THUMB_XL.jpg', (1280, 1280)),   # 0: XtraLarge
     ('SYNOPHOTO_THUMB_L.jpg', (800, 800)),      # 1: Large
@@ -48,6 +49,12 @@ THUMB_SIZES = [
 ]
 # Synology preview size (keep ratio, pad with black)
 PREVIEW_SIZE = ('SYNOPHOTO_THUMB_PREVIEW.jpg', (120, 160))
+# Synology thumbnail sizes (fit to size) for videos, descending order
+THUMB_SIZES_VIDEO = [
+    THUMB_SIZES[0],
+    THUMB_SIZES[3]
+]
+PREVIEW_SIZE_VIDEO = ('SYNOPHOTO:FILM.flv', (320, 180))
 
 
 ###############################################################################
@@ -108,7 +115,7 @@ def media_queue_builder(rootdir):
                     if file not in IGNORED_FILES:  # maybe remove (?)
                         media_queue.put(os.path.join(path, file))
                         print("[+] Added %s to queue" % os.path.join(path,
-                              file))
+                                                                     file))
 
 
 def _is_tool(name):
@@ -156,8 +163,8 @@ def _image_converter(file):
         _generate_thumbnails(file, Image.open(file))
     except OSError as e:
         failed_files.append(file)
-        print("[-] Failed to read image %s" % file)
-        print("[-] Exception: %s" % e.strerror)
+        print("[X] Failed to read image %s" % file)
+        print("[X] Exception: %s" % e)
 
 
 def _raw_converter(file):
@@ -169,21 +176,29 @@ def _raw_converter(file):
     print("[-] Converting raw image %s" % file)
     try:
         dcraw_cmd = "dcraw -c -b 8 -q 0 -w -H 5 '%s'" % file
-        dcraw_proc = subprocess.Popen(
-            shlex.split(dcraw_cmd), stdout=subprocess.PIPE)
+        dcraw_proc = subprocess.Popen(shlex.split(dcraw_cmd),
+                                      stdout=subprocess.PIPE)
         image_raw = BytesIO(dcraw_proc.communicate()[0])
         _generate_thumbnails(file, Image.open(image_raw))
     except Exception as e:
         failed_files.append(file)
-        print("[-] Failed to convert raw image %s" % file)
-        print("[-] Exception: %s" % e.message)
+        print("[X] Failed to convert raw image %s" % file)
+        print("[X] Exception: %s" % e.message)
 
 
 def _generate_thumbnails(file, image):
     """
     Generates thumbnail and preview files for the provided image.
     """
-    thumbs_dir = _make_thumbs_dir(file)
+    thumbs_dir = None
+    try:
+        thumbs_dir = _make_thumbs_dir(file)
+    except:  # Failed to generate thumbs dir (other exceptions possible?)
+        print("[X] Failed to create thumbnail directory for %s" % file)
+        failed_files.append(file)
+        return
+
+    _rotate_image(image)
 
     # Generate thumbnails in all sizes by consecutively shrinking
     # the original image
@@ -203,12 +218,79 @@ def _generate_thumbnails(file, image):
     preview_img.save(os.path.join(thumbs_dir, preview_name), quality=90)
 
 
+def _rotate_image(image):
+    """
+    Attempts to rotate the provided image according to the EXIF information
+    found in the image.
+    """
+    try:
+        # code adapted from:
+        # http://www.lifl.fr/~riquetd/auto-rotating-pictures-using-pil.html
+        exif = image._getexif()
+        if exif:
+            orientation_key = 274  # cf ExifTags
+            if orientation_key in exif:
+                orientation = exif[orientation_key]
+
+                rotate_values = {3: 180, 6: 270, 8: 90}
+
+                if orientation in rotate_values:
+                    image = image.rotate(rotate_values[orientation])
+    except:
+        pass  # could not rotate image, proceed with image as is
+
+
 def _video_converter(file):
     """
     Generats video previews for video files (with an extension in
     VIDEO_EXTENSIONS).
     """
-    pass
+    thumbs_dir = None
+    try:
+        thumbs_dir = _make_thumbs_dir(file)
+    except:  # Failed to generate thumbs dir (other exceptions possible?)
+        print("[X] Failed to create thumbnail directory for %s" % file)
+        failed_files.append(file)
+        return
+
+    # Generate .flv preview video
+    ffmpeg_cmd = 'ffmpeg -loglevel panic -i "%s" -y -ar 44100 -r 12 ' \
+                 '-ac 2 -f flv -qscale 5 -s 320x180 -aspect 320:180 -t 30 ' \
+                 '"%s/%s"' % (file, thumbs_dir, PREVIEW_SIZE_VIDEO[0])
+    # TODO: replace -s and -aspect with PREVIEW_SIZE_VIDEO[1]
+    # TODO: cut preview to x seconds? Possible options:
+    #       -fs limit_size (output)
+    #           Set the file size limit, expressed in bytes. No further chunk
+    #           of bytes is written after the limit is exceeded. The size of
+    #           the output file is slightly more than the requested file size.
+    #       -t duration (input/output)
+    #           When used as an input option (before -i), limit the duration
+    #           of data read from the input file.
+    #           When used as an output option (before an output filename),
+    #           stop writing the output after its duration reaches duration.
+    # TODO: make -t an option
+
+    ffmpeg_proc = subprocess.Popen(shlex.split(ffmpeg_cmd),
+                                   stdout=subprocess.PIPE)
+    ffmpeg_proc.communicate()[0]
+
+    # Generate temporary preview image
+    file_dir, file_name = os.path.split(file)
+    thumb_temp = os.path.join('/tmp', os.path.splitext(file_name)[0] + ".jpg")
+    ffmpeg_thumb_cmd = 'ffmpeg -loglevel panic -i "%s" -y -an -ss 00:00:03 ' \
+                       '-an -r 1 -vframes 1 "%s"' % (file, thumb_temp)
+    # TODO: make -ss timecode an option
+
+    ffmpeg_thumb_proc = subprocess.Popen(shlex.split(ffmpeg_thumb_cmd),
+                                         stdout=subprocess.PIPE)
+    ffmpeg_thumb_proc.communicate()[0]
+
+    # Generate thumbnails in all sizes by consecutively shrinking
+    # the original image
+    image = Image.open(thumb_temp)
+    for thumb_name, size in THUMB_SIZES_VIDEO:
+        image.thumbnail(size, Image.ANTIALIAS)
+        image.save(os.path.join(thumbs_dir, thumb_name), quality=90)
 
 
 def _make_thumbs_dir(file):
@@ -253,7 +335,10 @@ def main():
         t.join()
 
     print("[+] Thumbnail generation completed in %i seconds" % (time.time() -
-          START_TIME))
+                                                                START_TIME))
+    print('[+] The following files had errors during execution:')
+    for file in failed_files:
+        print('\t%s' % file)
 
 
 if __name__ == '__main__':
