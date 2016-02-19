@@ -9,8 +9,9 @@
 # ```
 #
 # TODO: mount share and use rsync to sync files to share at the end
-# TODO: add -f option to force generation of thumbnails
-# TODO: add -v option = verbose mode
+# TODO: Replace PIl with Pillow ?
+# TODO: Replaxe threading/Queue with multiprocessing ?
+#       See https://github.com/mbrrg/synology-thumbgen/blob/master/psthumbgen.py
 import time
 import argparse
 import os
@@ -19,10 +20,10 @@ import threading
 import subprocess
 import shlex
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFile
 from io import StringIO, BytesIO
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 START_TIME = time.time()  # Start time for measurements
 
 ###############################################################################
@@ -40,20 +41,20 @@ IGNORED_FILES = [".DS_Store", ".apdisk", "Thumbs.db"]
 THUMB_DIR = '@eaDir'
 # Synology thumbnail sizes (fit to size), descending order
 # See http://www.web3.lu/managing-thumbnails-synology-photostation/
-THUMB_SIZES = [
+THUMB_SIZES = (
     ('SYNOPHOTO_THUMB_XL.jpg', (1280, 1280)),   # 0: XtraLarge
     ('SYNOPHOTO_THUMB_L.jpg', (800, 800)),      # 1: Large
     ('SYNOPHOTO_THUMB_B.jpg', (640, 640)),      # 2: Big
     ('SYNOPHOTO_THUMB_M.jpg', (320, 320)),      # 3: Medium
     ('SYNOPHOTO_THUMB_S.jpg', (160, 160))       # 4: Small
-]
+)
 # Synology preview size (keep ratio, pad with black)
 PREVIEW_SIZE = ('SYNOPHOTO_THUMB_PREVIEW.jpg', (120, 160))
 # Synology thumbnail sizes (fit to size) for videos, descending order
-THUMB_SIZES_VIDEO = [
+THUMB_SIZES_VIDEO = (
     THUMB_SIZES[0],
     THUMB_SIZES[3]
-]
+)
 PREVIEW_SIZE_VIDEO = ('SYNOPHOTO:FILM.flv', (320, 180))
 
 
@@ -81,7 +82,15 @@ parser.add_argument('-v', '--verbose', dest='verbose', action='store_true',
                     help='enable verbose output')
 parser.add_argument('-t', '--threads', metavar='N', dest='num_of_threads',
                     type=int, default=4,
-                    help='number of threads to use')
+                    help='number of threads to use, default: 4')
+parser.add_argument('-vd', metavar='S', dest='video_duration',
+                    type=int, default=30,
+                    help='maximum duration of generated preview videos, ' +
+                         'default: 30')
+parser.add_argument('-vt', metavar='HH:MM:SS', dest='video_timecode',
+                    default='00:00:03',
+                    help='timecode for the frame to use for generating ' +
+                         'video thumbnails, default: 00:00:03')
 parser.add_argument('--version', action='version',
                     version='%(prog)s ' + VERSION)
 
@@ -159,12 +168,19 @@ def _image_converter(file):
     Generats thumbnails for image files (with an extension in
     IMAGE_EXTENSIONS).
     """
+    image = Image.open(file)
     try:
-        _generate_thumbnails(file, Image.open(file))
+        image.load()
+        _generate_thumbnails(file, image)
     except OSError as e:
-        failed_files.append(file)
-        print("[X] Failed to read image %s" % file)
-        print("[X] Exception: %s" % e)
+        try:
+            ImageFile.LOAD_TRUNCATED_IMAGES = True
+            _generate_thumbnails(file, image)
+            ImageFile.LOAD_TRUNCATED_IMAGES = False
+        except OSError as e2:
+            failed_files.append(file)
+            print("[X] Failed to read image %s" % file)
+            print("[X] Exception: %s" % e2)
 
 
 def _raw_converter(file):
@@ -336,9 +352,11 @@ def main():
 
     print("[+] Thumbnail generation completed in %i seconds" % (time.time() -
                                                                 START_TIME))
-    print('[+] The following files had errors during execution:')
-    for file in failed_files:
-        print('\t%s' % file)
+
+    if failed_files:
+        print('[+] The following files had errors during execution:')
+        for file in failed_files:
+            print('\t%s' % file)
 
 
 if __name__ == '__main__':
